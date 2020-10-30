@@ -1,7 +1,8 @@
-import copy
 from datetime import datetime
+from django.core.exceptions import ValidationError
 from django.db import models
 from django.db.models.base import ModelBase
+from django.db.models.fields import Field
 from django.db.models.options import DEFAULT_NAMES as META_OPTIONS_DEFAULT_NAMES
 
 
@@ -17,11 +18,28 @@ class JournaledQuerySet(models.QuerySet):
         raise NotImplementedError
 
 
+class JournalModel(models.Model):
+    def save(self, *args, **kwargs): # pylint:disable=arguments-differ
+        # A existing journal entry may not be overriden
+        if self.pk:
+            raise ValidationError("Cannot update a journal entry")
+
+        super().save(*args, **kwargs)
+
+    def delete(self, using=None, keep_parents=False):
+        raise ValidationError("Cannot delete a journal entry")
+
+    class Meta:
+        abstract = True
+
+
 class JournalMeta:
     unique_together = ('parent', 'timestamp',)
     indexes = (
         models.Index(fields=('parent', 'timestamp',)),
     )
+    default_permissions = ()
+    ordering = ['timestamp',]
 
 
 class JournaledModelMixinMeta(ModelBase):
@@ -51,9 +69,14 @@ class JournaledModelMixinMeta(ModelBase):
             'parent': models.ForeignKey(new_class, on_delete=models.CASCADE, related_name='journal_entries'),
             'timestamp': models.DateTimeField(auto_now_add=True, editable=False),
         }
-        journal_attrs.update(copy.deepcopy(attrs))
 
-        new_journal_class = super_new(cls, name + 'Journal', bases, journal_attrs, **kwargs)
+        for att_name, att_value in attrs.items():
+            if not isinstance(att_value, Field):
+                continue
+
+            journal_attrs[att_name] = att_value
+
+        new_journal_class = super_new(cls, name + 'Journal', (JournalModel,) + bases, journal_attrs, **kwargs)
         new_journal_class._meta.journal = True
         new_journal_class._meta.journaled = False
         new_journal_class._meta.journaled_model = new_class
@@ -71,20 +94,29 @@ class JournaledModelMixinMeta(ModelBase):
         return super().__repr__()
 
 
-class JournaledModelMixin(metaclass=JournaledModelMixinMeta):
+class JournaledModelMixin(models.Model, metaclass=JournaledModelMixinMeta):
     def get_at_timestamp(self, timestamp: datetime):
         journal_entries = self.journal_entries.filter(timestamp__lte=timestamp).order_by('timestamp')
         return journal_entries.first()
 
-    def save(self, *args, **kwargs):
-        ret = super().save(*args, **kwargs)
+    def save(self, *args, **kwargs): # pylint:disable=arguments-differ
+        super().save(*args, **kwargs)
 
         if not self._meta.journaled:
-            return ret
+            return
 
         self.journal_entries.create(**{
             field.attname: getattr(self, field.attname)
             for field in self._meta.fields if field != self._meta.pk
         })
 
-        return ret
+    @property
+    def update_datetime(self) -> datetime:
+        return self.journal_entries.last().timestamp
+
+    @property
+    def create_datetime(self) -> datetime:
+        return self.journal_entries.first().timestamp
+
+    class Meta:
+        abstract = True
